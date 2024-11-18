@@ -1,0 +1,2 @@
+# StoryGenerator
+LLMとDiffusionを組み合わせてローカルで自動的に紙芝居形式の物語を作りだす。
