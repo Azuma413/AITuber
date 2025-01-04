@@ -2,16 +2,12 @@ from dotenv import load_dotenv
 load_dotenv()
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
-from typing import Annotated, List, Literal, TypedDict
-from langgraph.checkpoint.memory import MemorySaver
+from typing import Annotated, List, Literal
 from langgraph.graph import END, START, StateGraph, MessagesState
-from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
-from langchain.memory import ConversationBufferWindowMemory
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from browser_use import Agent
 import asyncio
@@ -26,20 +22,14 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 # 会話履歴数をmax_lengthに制限するLimitedChatMessageHistoryクラス
 DEFAULT_MAX_MESSAGES = 10 # 会話履歴の保持数
 class LimitedChatMessageHistory(ChatMessageHistory):
-
-    # 会話履歴の保持数
     max_messages: int = DEFAULT_MAX_MESSAGES
-
     def __init__(self, max_messages=DEFAULT_MAX_MESSAGES):
         super().__init__()
         self.max_messages = max_messages
-
     def add_message(self, message):
         super().add_message(message)
-        # 会話履歴数を制限
         if len(self.messages) > self.max_messages:
             self.messages = self.messages[-self.max_messages:]
-
     def get_messages(self):
         return self.messages
 
@@ -50,21 +40,31 @@ class TalkInput:
 # TalkModelの出力形式を定義
 class TalkFormat(BaseModel):
     reply: str = Field(..., description="マネージャーや視聴者に対する返答")
-    action: str = Field(..., description="次の行動．以下のいずれかから選択: Nothing, Think, WebSearch")
-    emotion: str = Field(..., description="現在の感情．以下のいずれかから選択: normal, happy, angry, sad, surprised, shy, excited, smug, teasing, confused")
+    action: Literal["Nothing", "Think", "WebSearch"] = Field(..., description="次の行動．以下のいずれかから選択: Nothing, Think, WebSearch")
+    emotion: Literal["normal", "happy", "angry", "sad", "surprised", "shy", "excited", "smug", "teasing", "confused"] = Field(..., description="現在の感情．以下のいずれかから選択: normal, happy, angry, sad, surprised, shy, excited, smug, teasing, confused")
 
 class ManagerFormat(BaseModel):
     feedback: str = Field(..., description="Vtuberに対するフィードバック．scoreが2以下の場合に記述．")
-    score: int = Field(..., description="Vtuberの発言に対する評価．0から9の10段階．")
+    score: int = Field(..., ge=0, le=9, description="Vtuberの発言に対する評価．0から9の10段階．")
 
 class AItuber:
     def __init__(self):
         gemini_flash = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.7)
         gemini_think = ChatGoogleGenerativeAI(model="gemini-2.0-flash-thinking-exp-1219", temperature=0.7)
-        tool_list = [self.talk_to_the_manager]
+        tool_list = [self.think, self.web_search]
         self.message_history = {}
         self.session_id = None
-
+        self.get_comment_time = None # youtubeのコメント取得時間
+        self.setting_vr = self.create_vector_retriever(top_k=1, path="./chroma-db-setting")
+        self.memory_vr = self.create_vector_retriever(top_k=3, path="./chroma-db-memory")
+        # setting.txtのデータをvector_retrieverに追加
+        with open("./setting.txt", "r") as f:
+            setting_texts = f.read().splitlines()
+            self.add_data_to_vr(self.setting_vr, setting_texts)
+        # memory.txtのデータをvector_retrieverに追加
+        with open("./memory.txt", "r") as f:
+            memory_texts = f.read().splitlines()
+            self.add_data_to_vr(self.memory_vr, memory_texts)
         # TalkModelの設定
         talk_prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="""
@@ -183,11 +183,7 @@ conversation: <conversation>
     conversation: 会話の流れ．
 """
             ),
-            HumanMessage(content="""
-tool: {tool}
-conversation: {conversation}
-"""
-            ),
+            HumanMessage(content="tool: {tool}\nconversation: {conversation}")
         ])
         self.assist_model = AgentExecutor(
             agent = create_tool_calling_agent(gemini_flash, tool_list, assist_prompt),
@@ -204,14 +200,6 @@ conversation: {conversation}
             MessagesPlaceholder(variable_name="messages")
         ])
         self.think_model = think_prompt | gemini_think
-        # WebSearchModelの設定
-        web_search_prompt = ChatPromptTemplate.from_messages([
-            SystemMessage(content="""
-入力された内容を日本語で簡潔にまとめてください．
-"""),
-            MessagesPlaceholder(variable_name="messages")
-        ])
-        self.web_search_model = web_search_prompt | gemini_flash
         # ManagerModelの設定
         manager_prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="""
@@ -237,7 +225,8 @@ conversation: {conversation}
         workflow.add_edge("assist", "talk")
         workflow.add_edge("manager", "fix_format")
         workflow.add_edge("fix_format", "talk")
-    def get_session_history(self, session_id: str) -> BaseChatMessageHistory:
+        self.graph = workflow.compile()
+    def get_session_history(self, session_id: str) -> LimitedChatMessageHistory:
         if self.session_id is None:
             self.session_id = session_id
         if session_id not in self.message_history:
@@ -252,41 +241,45 @@ conversation: {conversation}
         for m in messages:
             conversation += m.content + "\n"
         return conversation
-    def create_vector_retriever(self, top_k: int = 5):
+    def create_vector_retriever(self, top_k: int = 5, path: str = "./chroma-db"):
         embeddings = HuggingFaceEmbeddings(model_name="sbintuitions/sarashina-embedding-v1-1b")
-        client = chromadb.PersistetClient(path="./chroma-db")
+        client = chromadb.PersistentClient(path=path)
         vector_store = Chroma(
             collection_name="ai-tuber",
             embedding_function=embeddings,
-            client=client,
+            client=client
         )
         vector_retriever = vector_store.as_retriever(search_kwargs={"k": top_k})
         return vector_retriever
-    def add_data_to_vr(self, vector_retriever, text: str, metadata: dict):
-        vs = vector_retriever.vector_store
-        # vector_storeのid数を取得
-        id_num = len(vs)
-        new_id = f"ai-tuber-{id_num}"
-        vs.add(text, metadata, new_id)
-    def talk_cond_func(state: MessagesState) -> Literal["assist", "manager"]:
+    def add_data_to_vr(self, vector_retriever, texts , metadata=None):
+        if not texts:
+            return
+        vs = vector_retriever.vectorstore
+        ids = [f"doc-{str(i).zfill(4)}" for i in range(len(vs.get()))]
+        vs.add_texts(texts=texts, ids=ids, metadatas=metadata if metadata else [{}]*len(texts))
+    def talk_cond_func(self, state: MessagesState) -> Literal["assist", "manager"]:
         last_message = state['messages'][-1]
         if last_message.action == "Think" or last_message.action == "WebSearch":
             return "assist"
         return "manager"
-    def manager_cond_func(state: MessagesState) -> Literal["talk", END]:
+
+    def manager_cond_func(self, state: MessagesState) -> Literal["talk", END]:
         last_message = state['messages'][-1]
         if last_message.score > 2:
             return END
         return "talk"
     def call_talk_model(self, input: TalkInput):
-        setting = 
-        memory = 
+        setting_docs = self.setting_vr.get_relevant_documents(input.input)
+        memory_docs = self.memory_vr.get_relevant_documents(input.input)
+        setting = "\n".join([doc.page_content for doc in setting_docs])
+        memory = "\n".join([doc.page_content for doc in memory_docs])
         message = f"name: {input.name}\ninput: {input.input}\nsetting: {setting}\nmemory: {memory}"
-        response = self.talk_model.invoke({'message': message})
+        response = self.talk_model.invoke(message)
         self.send_unity(response)
-
-        # 入出力をデータベースに保存
-        
+        save_data = f"{input.name}: {input.input}\nあなた: {response.reply}\n"
+        self.add_data_to_vr(self.memory_vr, [save_data])
+        with open("./memory.txt", "a") as f:
+            f.write(save_data)
         return {"messages": [response]}
     def call_assist_model(self, state: MessagesState) -> TalkInput:
         conversation = self.get_conversation(self.message_history[self.session_id])
@@ -302,11 +295,13 @@ conversation: {conversation}
         last_message = state['messages'][-1]
 
         # Youtubeにコメント書き込み
+        print(last_message)
         
-        return TalkInput(name="manager", input=last_message)
+        return TalkInput(name="manager", input=last_message.feedback)
     def send_unity(self, data: TalkFormat):
         
         # http通信でUnityにデータを送信
+        print(data.reply)
         
         pass
     @tool
@@ -315,11 +310,32 @@ conversation: {conversation}
     ) -> str:
         """Think about the input."""
         response = await self.think_model.invoke({'messages': input})
-        return response
+        return response.content
     @tool
     async def web_search(self,
         input: Annotated[str, "what to search for"],
     ) -> str:
         """Search the web for the input."""
-        response = await self.web_search_model.invoke({'messages': input})
-        return response
+        agent = Agent(
+            task=input,
+            llm=ChatOpenAI(model="gpt-4o-mini"),
+        )
+        result = await agent.run()
+        return result
+    def main(self, name:str = None, input:str = None):
+        if name is None or input is None:
+            name, input = self.get_youtube_comment()
+        input = TalkInput(name=name, input=input)
+        self.graph.invoke(input)
+        return
+    def get_youtube_comment(self):
+
+        # youtubeのコメントを取得
+        
+        name = "ユーザーA"
+        input = "次のオリンピックってどこだったっけ？"
+        return name, input
+
+if __name__ == "__main__":
+    aituber = AItuber()
+    aituber.main()
