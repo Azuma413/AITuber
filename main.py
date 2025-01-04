@@ -43,7 +43,9 @@ class LimitedChatMessageHistory(ChatMessageHistory):
     def get_messages(self):
         return self.messages
 
-
+class TalkInput:
+    name: str
+    input: str
 
 # TalkModelの出力形式を定義
 class TalkFormat(BaseModel):
@@ -170,6 +172,7 @@ emotion: excited
             SystemMessage(content="""
 会話の流れを読み取り，指定されたツールを呼び出してください．
 ツールに対してはできるだけ具体的な指示を行ってください．
+また，最終的な出力は日本語で簡潔に行ってください．
 
 モデルへの入力形式:
 ```input
@@ -186,7 +189,6 @@ conversation: {conversation}
 """
             ),
         ])
-        self.assist_model = assist_prompt | gemini_flash.bind_tools(tools_node)
         self.assist_model = AgentExecutor(
             agent = create_tool_calling_agent(gemini_flash, tool_list, assist_prompt),
             tools=tool_list
@@ -227,10 +229,14 @@ conversation: {conversation}
         workflow = StateGraph(MessagesState)
         workflow.add_node("talk", self.call_talk_model)
         workflow.add_node("assist", self.call_assist_model)
-        workflow.add_node("tools", tools_node)
-        workflow.add_edge(START, "agent") # STARTからagentノードへのエッジを追加
-        workflow.add_conditional_edges("agent", self.should_continue) # agentノードからのエッジを追加
-        workflow.add_edge("tools", 'agent') # toolsノードからagentノードへのエッジを追加
+        workflow.add_node('manager', self.call_manager_model)
+        workflow.add_node("fix_format", self.fix_format)
+        workflow.add_conditional_edges("talk", self.talk_cond_func)
+        workflow.add_conditional_edges("manager", self.manager_cond_func)
+        workflow.add_edge(START, "talk")
+        workflow.add_edge("assist", "talk")
+        workflow.add_edge("manager", "fix_format")
+        workflow.add_edge("fix_format", "talk")
     def get_session_history(self, session_id: str) -> BaseChatMessageHistory:
         if self.session_id is None:
             self.session_id = session_id
@@ -239,9 +245,13 @@ conversation: {conversation}
         return self.message_history[session_id]
     def get_conversation(self, message_history: LimitedChatMessageHistory, length: int = 2):
         messages = message_history.get_messages()
-        if len(messages) < length:
-            return messages
-        return messages[-length:]
+        if len(messages) > length:
+            messages = messages[-length:]
+        # messagesを結合して1つの文字列にする
+        conversation = ""
+        for m in messages:
+            conversation += m.content + "\n"
+        return conversation
     def create_vector_retriever(self, top_k: int = 5):
         embeddings = HuggingFaceEmbeddings(model_name="sbintuitions/sarashina-embedding-v1-1b")
         client = chromadb.PersistetClient(path="./chroma-db")
@@ -258,37 +268,58 @@ conversation: {conversation}
         id_num = len(vs)
         new_id = f"ai-tuber-{id_num}"
         vs.add(text, metadata, new_id)
-    def send_unity(self, text: str):
-        print("Unity: " + text)
-        # http通信でUnityに送信
-    def should_continue(state: MessagesState) -> Literal["tools", END]:
-        messages = state['messages']
-        print(messages)
-        last_message = messages[-1]
-        # If the LLM makes a tool call, then we route to the "tools" node
-        if last_message.tool_calls:
-            return "tools"
-        # Otherwise, we stop (reply to the user)
-        return END
-    def call_talk_model(self, state: MessagesState):
-        messages = state['messages']
-        print(messages)
-        response = self.talk_model.invoke(messages)
-        # We return a list, because this will get added to the existing list
-        return {"messages": [response]}
-    
-    
-    
-    @tool
-    async def talk_to_the_manager(self) -> str:
-        """Talk to your manager."""
-        hogehoge = ""
-        return hogehoge
+    def talk_cond_func(state: MessagesState) -> Literal["assist", "manager"]:
+        last_message = state['messages'][-1]
+        if last_message.action == "Think" or last_message.action == "WebSearch":
+            return "assist"
+        return "manager"
+    def manager_cond_func(state: MessagesState) -> Literal["talk", END]:
+        last_message = state['messages'][-1]
+        if last_message.score > 2:
+            return END
+        return "talk"
+    def call_talk_model(self, input: TalkInput):
+        setting = 
+        memory = 
+        message = f"name: {input.name}\ninput: {input.input}\nsetting: {setting}\nmemory: {memory}"
+        response = self.talk_model.invoke({'message': message})
+        self.send_unity(response)
 
+        # 入出力をデータベースに保存
+        
+        return {"messages": [response]}
+    def call_assist_model(self, state: MessagesState) -> TalkInput:
+        conversation = self.get_conversation(self.message_history[self.session_id])
+        last_message = state['messages'][-1]
+        response = self.assist_model.invoke({'tool': last_message.action, 'conversation': conversation})
+        talk_input = TalkInput(name=last_message.action, input=response)
+        return talk_input
+    def call_manager_model(self, state: MessagesState):
+        conversation = self.get_conversation(self.message_history[self.session_id])
+        response = self.manager_model.invoke({'messages': conversation})
+        return {"messages": [response]}
+    def fix_format(self, state: MessagesState) -> TalkInput:
+        last_message = state['messages'][-1]
+
+        # Youtubeにコメント書き込み
+        
+        return TalkInput(name="manager", input=last_message)
+    def send_unity(self, data: TalkFormat):
+        
+        # http通信でUnityにデータを送信
+        
+        pass
     @tool
-    def multiply_by_max(
-        a: Annotated[int, "scale factor"],
-        b: Annotated[List[int], "list of ints over which to take maximum"],
-    ) -> int:
-        """Multiply a by the maximum of b."""
-        return a * max(b)
+    async def think(self,
+        input: Annotated[str, "what to think about"],
+    ) -> str:
+        """Think about the input."""
+        response = await self.think_model.invoke({'messages': input})
+        return response
+    @tool
+    async def web_search(self,
+        input: Annotated[str, "what to search for"],
+    ) -> str:
+        """Search the web for the input."""
+        response = await self.web_search_model.invoke({'messages': input})
+        return response
