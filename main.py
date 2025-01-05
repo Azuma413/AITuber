@@ -15,7 +15,7 @@ import chromadb
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.globals import set_verbose, set_debug
 
-DEBUG = False
+DEBUG = True
 set_debug(DEBUG)
 set_verbose(DEBUG)
 
@@ -336,7 +336,7 @@ conversation: <conversation>
         # youtubeのコメントを取得
         
         name = "ユーザーA"
-        input = "あなたの名前を教えて"
+        input = "ホログラム宇宙論についてWebで調べて"
         return name, input
 
 if __name__ == "__main__":
