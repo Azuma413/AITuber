@@ -7,36 +7,17 @@ from langchain_core.tools import tool
 from typing import Annotated, List, Literal
 from langgraph.graph import END, START, StateGraph, MessagesState
 from pydantic import BaseModel, Field
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, AIMessage
 from browser_use import Agent
-from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 import chromadb
 from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.globals import set_verbose, set_debug
 
-message_history = {}
-
-# 会話履歴数をmax_lengthに制限するLimitedChatMessageHistoryクラス
-DEFAULT_MAX_MESSAGES = 10 # 会話履歴の保持数
-class LimitedChatMessageHistory(ChatMessageHistory):
-    max_messages: int = DEFAULT_MAX_MESSAGES
-    def __init__(self, max_messages=DEFAULT_MAX_MESSAGES):
-        super().__init__()
-        self.max_messages = max_messages
-    def add_message(self, message):
-        print("add_message: ", message)
-        super().add_message(message)
-        if len(self.messages) > self.max_messages:
-            self.messages = self.messages[-self.max_messages:]
-    def get_messages(self):
-        return self.messages
-
-def get_session_history(session_id: str) -> LimitedChatMessageHistory:
-    if session_id not in message_history:
-        message_history[session_id] = LimitedChatMessageHistory()
-    return message_history[session_id]
+DEBUG = False
+set_debug(DEBUG)
+set_verbose(DEBUG)
 
 class TalkInput(BaseModel):
     name: str
@@ -57,6 +38,8 @@ class AItuber:
         gemini_flash = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.7)
         gemini_think = ChatGoogleGenerativeAI(model="gemini-2.0-flash-thinking-exp-1219", temperature=0.7)
         tool_list = [self.think, self.web_search]
+        self.message_history = []
+        self.mh_limit = 10 # 10なら対話5回分の履歴を保持
         self.session_id = "ai-tuber"
         self.get_comment_time = None # youtubeのコメント取得時間
         self.setting_vr = self.create_vector_retriever(top_k=1, path="./chroma-db-setting")
@@ -66,7 +49,7 @@ class AItuber:
             setting_texts = f.read().splitlines()
             self.add_data_to_vr(self.setting_vr, setting_texts)
         # memory.txtのデータをvector_retrieverに追加
-        with open("./memory.txt", "r") as f:
+        with open("./memory.txt", "r", encoding='utf-8') as f:
             memory_texts = f.read().splitlines()
             self.add_data_to_vr(self.memory_vr, memory_texts)
         # TalkModelの設定
@@ -163,14 +146,9 @@ emotion: excited
 """
             ),
             MessagesPlaceholder(variable_name="history"),
-            HumanMessage(content="{message}")
+            MessagesPlaceholder(variable_name="message"),
         ])
-        self.talk_model = RunnableWithMessageHistory(
-            runnable = talk_prompt | gemini_flash.with_structured_output(TalkFormat),
-            input_messages_key = "message",
-            history_messages_key = "history",
-            get_session_history = get_session_history
-        )
+        self.talk_model = talk_prompt | gemini_flash.with_structured_output(TalkFormat)
         # AssistModelの設定
         assist_prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="""
@@ -230,18 +208,13 @@ conversation: <conversation>
         workflow.add_edge("assist", "talk")
         workflow.add_edge("fix_format", "talk")
         self.graph = workflow.compile()
-    def get_conversation(self, message_history: LimitedChatMessageHistory, length: int = 2):
-        messages = message_history.get_messages()
-        if len(messages) > length:
-            messages = messages[-length:]
-        # messagesを結合して1つの文字列にする
-        conversation = ""
-        for m in messages:
-            print("get_conv: ", m)
-            conversation += m.content + "\n"
-        if len(messages) == 0:
-            conversation = "No history\n"
-        return conversation
+    def add_history(self, message: BaseMessage):
+        if len(self.message_history) >= self.mh_limit:
+            self.message_history.pop(0)
+        self.message_history.append(message)
+    def get_history(self, length: int = 4) -> str:
+        msgs = self.message_history[-length:]
+        return "\n".join([msg.content for msg in msgs])
     def create_vector_retriever(self, top_k: int = 5, path: str = "./chroma-db"):
         embeddings = HuggingFaceEmbeddings(model_name="sbintuitions/sarashina-embedding-v1-1b")
         client = chromadb.PersistentClient(path=path)
@@ -279,22 +252,26 @@ conversation: <conversation>
         memory_docs = self.memory_vr.invoke(input.input)
         setting = "\n".join([doc.page_content for doc in setting_docs])
         memory = "\n".join([doc.page_content for doc in memory_docs])
-        message = {"message": f"setting: <{setting}>\nmemory: <{memory}>\nname: {input.name}\ninput: {input.input}"}
-        config = {"configurable": {"session_id": self.session_id}}
-        print("TalkModel input: ", message)
-        response = self.talk_model.invoke(message, config)
+        history = self.message_history
+        # historyが空のリストの場合は適当な文字列を入れる
+        if not history:
+            history = [HumanMessage(content="No conversation history")]
+        message = [HumanMessage(content=f"setting: <{setting}>\nmemory: <{memory}>\nname: {input.name}\ninput: {input.input}")]
+        input_message = {"message": message, "history": history}
+        print("TalkModel input: ", input_message)
+        response = self.talk_model.invoke(input_message)
         print("TalkModel output: ", response)
-        print("history: ", message_history[self.session_id])
-        print("-----------------")
+        self.add_history(HumanMessage(content=f"{input.name}: {input.input}"))
+        self.add_history(AIMessage(content=f"雲霧星奈: {response.reply}"))
         self.send_unity(response)
-        save_data = f"{input.name}: {input.input}\nあなた: {response.reply}\n"
+        save_data = f"{input.name}: {input.input} 雲霧星奈: {response.reply}\n"
         self.add_data_to_vr(self.memory_vr, [save_data])
-        with open("./memory.txt", "a") as f:
+        with open("./memory.txt", "a", encoding="utf-8") as f:
             f.write(save_data)
         response = response.model_dump_json()
         return {"messages": [response]}
     def call_assist_model(self, state: MessagesState):
-        conversation = self.get_conversation(message_history[self.session_id])
+        conversation = self.get_history()
         last_message = state['messages'][-1].content
         last_message = TalkFormat.model_validate_json(last_message)
         input = {'tool': last_message.action, 'conversation': conversation}
@@ -304,7 +281,7 @@ conversation: <conversation>
         talk_input = TalkInput(name=last_message.action, input=response).model_dump_json()
         return {"messages": [talk_input]}
     def call_manager_model(self, state: MessagesState):
-        conversation = self.get_conversation(message_history[self.session_id])
+        conversation = self.get_history()
         input = {'conv': [HumanMessage(content=conversation)]}
         print("ManagerModel input: ", input)
         response = self.manager_model.invoke(input)
@@ -359,7 +336,7 @@ conversation: <conversation>
         # youtubeのコメントを取得
         
         name = "ユーザーA"
-        input = "次のオリンピックってどこだったっけ？"
+        input = "あなたの名前を教えて"
         return name, input
 
 if __name__ == "__main__":
