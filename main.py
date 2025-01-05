@@ -10,14 +10,13 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from browser_use import Agent
-import asyncio
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain.embeddings import HuggingFaceEmbeddings
-# from langchain_chroma import Chroma
-from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 import chromadb
 from langchain.agents import AgentExecutor, create_tool_calling_agent
+
+message_history = {}
 
 # 会話履歴数をmax_lengthに制限するLimitedChatMessageHistoryクラス
 DEFAULT_MAX_MESSAGES = 10 # 会話履歴の保持数
@@ -27,13 +26,19 @@ class LimitedChatMessageHistory(ChatMessageHistory):
         super().__init__()
         self.max_messages = max_messages
     def add_message(self, message):
+        print("add_message: ", message)
         super().add_message(message)
         if len(self.messages) > self.max_messages:
             self.messages = self.messages[-self.max_messages:]
     def get_messages(self):
         return self.messages
 
-class TalkInput:
+def get_session_history(session_id: str) -> LimitedChatMessageHistory:
+    if session_id not in message_history:
+        message_history[session_id] = LimitedChatMessageHistory()
+    return message_history[session_id]
+
+class TalkInput(BaseModel):
     name: str
     input: str
 
@@ -52,8 +57,7 @@ class AItuber:
         gemini_flash = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", temperature=0.7)
         gemini_think = ChatGoogleGenerativeAI(model="gemini-2.0-flash-thinking-exp-1219", temperature=0.7)
         tool_list = [self.think, self.web_search]
-        self.message_history = {}
-        self.session_id = None
+        self.session_id = "ai-tuber"
         self.get_comment_time = None # youtubeのコメント取得時間
         self.setting_vr = self.create_vector_retriever(top_k=1, path="./chroma-db-setting")
         self.memory_vr = self.create_vector_retriever(top_k=3, path="./chroma-db-memory")
@@ -89,15 +93,15 @@ class AItuber:
 
 モデルへの入力形式:
 ```input
-name: <name>
-input: <input>
 setting: <setting>
 memory: <memory>
+name: <name>
+input: <input>
 ```
-    name: 現在の入力を行った人物の名前。例: "ユーザーA", "Think", "WebSearch", "manager"など．nameとaction名が同じ場合は，actionを行った結果であると解釈する．
-    input: 入力テキスト。
     setting: 必要に応じて与えられるキャラクターの追加設定。
     memory: 過去の類似した会話の記憶。
+    name: 現在の入力を行った人物の名前。例: "ユーザーA", "Think", "WebSearch", "manager"など．nameとaction名が同じ場合は，actionを行った結果であると解釈する．
+    input: 入力テキスト。
 
 モデルの出力形式:
 ```output
@@ -135,10 +139,10 @@ emotion: <emotion>
 
 例:
 ```input
-name: ファンA
-input: 次のオリンピックってどこだったっけ？
 setting:
 memory:
+name: ファンA
+input: 次のオリンピックってどこだったっけ？
 ```
 ```output
 reply: えーっと，どこだったっけ？ フランスだったかな？
@@ -146,10 +150,10 @@ action: WebSearch
 emotion: normal
 ```
 ```input
-name: WebSearch
-input: 次のオリンピックの開催地はフランスです．
 setting:
 memory:
+name: WebSearch
+input: 次のオリンピックの開催地はフランスです．
 ```
 ```output
 reply: あっ、そうそう！次のオリンピックはフランスのパリだよ！パリでのオリンピック、めっちゃ楽しみだね。
@@ -165,7 +169,7 @@ emotion: excited
             runnable = talk_prompt | gemini_flash.with_structured_output(TalkFormat),
             input_messages_key = "message",
             history_messages_key = "history",
-            get_session_history = self.get_session_history
+            get_session_history = get_session_history
         )
         # AssistModelの設定
         assist_prompt = ChatPromptTemplate.from_messages([
@@ -183,7 +187,8 @@ conversation: <conversation>
     conversation: 会話の流れ．
 """
             ),
-            HumanMessage(content="tool: {tool}\nconversation: {conversation}")
+            HumanMessage(content="tool: {tool}\nconversation: {conversation}"),
+            ("placeholder", "{agent_scratchpad}"),
         ])
         self.assist_model = AgentExecutor(
             agent = create_tool_calling_agent(gemini_flash, tool_list, assist_prompt),
@@ -210,7 +215,7 @@ conversation: <conversation>
 評価が0または9の場合は，その理由も記述してください．2以下の場合は彼女にフィードバックを送り，改善を促してください．
 """
             ),
-            MessagesPlaceholder(variable_name="messages")
+            MessagesPlaceholder(variable_name="conv")
         ])
         self.manager_model = manager_prompt | gemini_flash.with_structured_output(ManagerFormat)
         # state graphを作成
@@ -223,15 +228,8 @@ conversation: <conversation>
         workflow.add_conditional_edges("manager", self.manager_cond_func)
         workflow.add_edge(START, "talk")
         workflow.add_edge("assist", "talk")
-        workflow.add_edge("manager", "fix_format")
         workflow.add_edge("fix_format", "talk")
         self.graph = workflow.compile()
-    def get_session_history(self, session_id: str) -> LimitedChatMessageHistory:
-        if self.session_id is None:
-            self.session_id = session_id
-        if session_id not in self.message_history:
-            self.message_history[session_id] = LimitedChatMessageHistory()
-        return self.message_history[session_id]
     def get_conversation(self, message_history: LimitedChatMessageHistory, length: int = 2):
         messages = message_history.get_messages()
         if len(messages) > length:
@@ -239,7 +237,10 @@ conversation: <conversation>
         # messagesを結合して1つの文字列にする
         conversation = ""
         for m in messages:
+            print("get_conv: ", m)
             conversation += m.content + "\n"
+        if len(messages) == 0:
+            conversation = "No history\n"
         return conversation
     def create_vector_retriever(self, top_k: int = 5, path: str = "./chroma-db"):
         embeddings = HuggingFaceEmbeddings(model_name="sbintuitions/sarashina-embedding-v1-1b")
@@ -254,54 +255,74 @@ conversation: <conversation>
     def add_data_to_vr(self, vector_retriever, texts , metadata=None):
         if not texts:
             return
+        if not isinstance(texts, list):
+            texts = [texts]
         vs = vector_retriever.vectorstore
-        ids = [f"doc-{str(i).zfill(4)}" for i in range(len(vs.get()))]
+        ids = [f"doc_{i}" for i in range(len(texts))]
         vs.add_texts(texts=texts, ids=ids, metadatas=metadata if metadata else [{}]*len(texts))
     def talk_cond_func(self, state: MessagesState) -> Literal["assist", "manager"]:
-        last_message = state['messages'][-1]
+        last_message = state['messages'][-1].content
+        last_message = TalkFormat.model_validate_json(last_message)
         if last_message.action == "Think" or last_message.action == "WebSearch":
             return "assist"
         return "manager"
-
-    def manager_cond_func(self, state: MessagesState) -> Literal["talk", END]:
-        last_message = state['messages'][-1]
+    def manager_cond_func(self, state: MessagesState) -> Literal["fix_format", END]:
+        last_message = state['messages'][-1].content
+        last_message = ManagerFormat.model_validate_json(last_message)
         if last_message.score > 2:
             return END
-        return "talk"
-    def call_talk_model(self, input: TalkInput):
-        setting_docs = self.setting_vr.get_relevant_documents(input.input)
-        memory_docs = self.memory_vr.get_relevant_documents(input.input)
+        return "fix_format"
+    def call_talk_model(self, state: MessagesState):
+        last_msg = state['messages'][-1].content
+        input = TalkInput.model_validate_json(last_msg)
+        setting_docs = self.setting_vr.invoke(input.input)
+        memory_docs = self.memory_vr.invoke(input.input)
         setting = "\n".join([doc.page_content for doc in setting_docs])
         memory = "\n".join([doc.page_content for doc in memory_docs])
-        message = f"name: {input.name}\ninput: {input.input}\nsetting: {setting}\nmemory: {memory}"
-        response = self.talk_model.invoke(message)
+        message = {"message": f"setting: <{setting}>\nmemory: <{memory}>\nname: {input.name}\ninput: {input.input}"}
+        config = {"configurable": {"session_id": self.session_id}}
+        print("TalkModel input: ", message)
+        response = self.talk_model.invoke(message, config)
+        print("TalkModel output: ", response)
+        print("history: ", message_history[self.session_id])
+        print("-----------------")
         self.send_unity(response)
         save_data = f"{input.name}: {input.input}\nあなた: {response.reply}\n"
         self.add_data_to_vr(self.memory_vr, [save_data])
         with open("./memory.txt", "a") as f:
             f.write(save_data)
+        response = response.model_dump_json()
         return {"messages": [response]}
-    def call_assist_model(self, state: MessagesState) -> TalkInput:
-        conversation = self.get_conversation(self.message_history[self.session_id])
-        last_message = state['messages'][-1]
-        response = self.assist_model.invoke({'tool': last_message.action, 'conversation': conversation})
-        talk_input = TalkInput(name=last_message.action, input=response)
-        return talk_input
+    def call_assist_model(self, state: MessagesState):
+        conversation = self.get_conversation(message_history[self.session_id])
+        last_message = state['messages'][-1].content
+        last_message = TalkFormat.model_validate_json(last_message)
+        input = {'tool': last_message.action, 'conversation': conversation}
+        print("AssistModel input: ", input)
+        response = self.assist_model.invoke(input)
+        print("AssistModel output", response)
+        talk_input = TalkInput(name=last_message.action, input=response).model_dump_json()
+        return {"messages": [talk_input]}
     def call_manager_model(self, state: MessagesState):
-        conversation = self.get_conversation(self.message_history[self.session_id])
-        response = self.manager_model.invoke({'messages': conversation})
+        conversation = self.get_conversation(message_history[self.session_id])
+        input = {'conv': [HumanMessage(content=conversation)]}
+        print("ManagerModel input: ", input)
+        response = self.manager_model.invoke(input)
+        print("ManagerModel output", response)
+        response = response.model_dump_json()
         return {"messages": [response]}
-    def fix_format(self, state: MessagesState) -> TalkInput:
-        last_message = state['messages'][-1]
+    def fix_format(self, state: MessagesState):
+        last_message = state['messages'][-1].content
+        last_message = ManagerFormat.model_validate_json(last_message)
 
         # Youtubeにコメント書き込み
-        print(last_message)
         
-        return TalkInput(name="manager", input=last_message.feedback)
+        msg = TalkInput(name="manager", input=last_message.feedback).model_dump_json()
+        return {"messages": [msg]}
+        # return {"messages": [TalkInput(name="manager", input=last_message.feedback)]}
     def send_unity(self, data: TalkFormat):
         
         # http通信でUnityにデータを送信
-        print(data.reply)
         
         pass
     @tool
@@ -325,8 +346,13 @@ conversation: <conversation>
     def main(self, name:str = None, input:str = None):
         if name is None or input is None:
             name, input = self.get_youtube_comment()
-        input = TalkInput(name=name, input=input)
-        self.graph.invoke(input)
+        input = TalkInput(name=name, input=input).model_dump_json()
+        events = self.graph.stream(
+            {"messages": [input]},
+            # stream_mode="values"
+        )
+        for event in events:
+            print(event)
         return
     def get_youtube_comment(self):
 
